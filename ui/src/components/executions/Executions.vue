@@ -40,8 +40,7 @@
         >
             <template #navbar v-if="isDisplayedTop">
                 <KestraFilter
-                    prefix="executions"
-                    :include="['namespace', 'state', 'scope', 'labels', 'child', 'relative_date', 'absolute_date']"
+                    domain="executions"
                     :buttons="{
                         refresh: {shown: true, callback: refresh},
                         settings: {shown: true, charts: {shown: true, value: showChart, callback: onShowChartChange}}
@@ -260,7 +259,7 @@
 
                         <el-table-column
                             prop="flowRevision"
-                            v-if="displayColumn('revision')"
+                            v-if="displayColumn('flowRevision')"
                             :label="$t('revision')"
                             class-name="shrink"
                         >

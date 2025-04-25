@@ -23,8 +23,10 @@ const bulidFromObject = (object: object): Value[] =>
         value,
     }));
 
-export function useValues(label: string) {
-    const {t} = useI18n({useScope: "global"});
+export function useValues(label: string, t?: ReturnType<typeof useI18n>["t"]) {
+    if (t === undefined) {
+        t = useI18n({useScope: "global"}).t;
+    }
 
     // Override for the scope labels on the dashboard
     const DASHBOARDS = ["dashboard", "custom_dashboard"];

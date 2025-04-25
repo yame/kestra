@@ -24,7 +24,7 @@ const buildComparator = (label: string, value: string, multiple: boolean = false
     return {label, value, multiple};
 };
 
-export function useFilters(prefix: string, isDefaultDashboard: boolean) {
+export function useFilters(prefix: string, isDefaultDashboard: boolean = false) {
     const {t} = useI18n({useScope: "global"});
 
     const comparator = (which: string) => `filters.comparators.${which}`;
@@ -204,7 +204,7 @@ export function useFilters(prefix: string, isDefaultDashboard: boolean) {
         }));
     }
 
-    const keys = {saved: `saved__${prefix}`};
+    const keys = {saved: `savedFilters__${prefix}`};
 
     return {
         getSavedItems: () => {
