@@ -85,6 +85,10 @@ public class JdbcExecutor implements ExecutorInterface, Service {
     private QueueInterface<Execution> executionQueue;
 
     @Inject
+    @Named(QueueFactoryInterface.EXECUTION_STATE_CHANGE_NAMED)
+    private QueueInterface<ExecutionStateChange> executionStateChange;
+
+    @Inject
     @Named(QueueFactoryInterface.WORKERJOB_NAMED)
     private QueueInterface<WorkerJob> workerJobQueue;
 
@@ -255,6 +259,7 @@ public class JdbcExecutor implements ExecutorInterface, Service {
             this.receiveCancellations.addFirst(this.executionQueue.receive(Executor.class, this::executionQueue));
             this.receiveCancellations.addFirst(this.workerTaskResultQueue.receive(Executor.class, this::workerTaskResultQueue));
         }
+        this.receiveCancellations.addFirst(this.executionStateChange.receive(Executor.class, this::executionStateChangeQueue));
         this.receiveCancellations.addFirst(this.killQueue.receive(Executor.class, this::killQueue));
         this.receiveCancellations.addFirst(this.subflowExecutionResultQueue.receive(Executor.class, this::subflowExecutionResultQueue));
         this.receiveCancellations.addFirst(this.subflowExecutionEndQueue.receive(Executor.class, this::subflowExecutionEndQueue));
@@ -999,62 +1004,9 @@ public class JdbcExecutor implements ExecutorInterface, Service {
             }
 
             Execution execution = executor.getExecution();
-            // handle flow triggers on state change
+            // send a message to the executionStateChange queue for post-execution actions
             if (!execution.getState().getCurrent().equals(executor.getOriginalState())) {
-                flowTriggerService.computeExecutionsFromFlowTriggers(execution, allFlows, Optional.of(multipleConditionStorage))
-                    .forEach(throwConsumer(executionFromFlowTrigger -> this.executionQueue.emit(executionFromFlowTrigger)));
-            }
-
-            // handle actions on terminated state
-            if (isTerminated) {
-                // if there is a parent, we send a subflow execution result to it
-                if (ExecutableUtils.isSubflow(execution)) {
-                    // locate the parent execution to find the parent task run
-                    String parentExecutionId = (String) execution.getTrigger().getVariables().get("executionId");
-                    String taskRunId = (String) execution.getTrigger().getVariables().get("taskRunId");
-                    String taskId = (String) execution.getTrigger().getVariables().get("taskId");
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> outputs = (Map<String, Object>) execution.getTrigger().getVariables().get("taskRunOutputs");
-                    Variables variables = variablesService.of(StorageContext.forExecution(executor.getExecution()), outputs);
-                    SubflowExecutionEnd subflowExecutionEnd = new SubflowExecutionEnd(executor.getExecution(), parentExecutionId, taskRunId, taskId, execution.getState().getCurrent(), variables);
-                    this.subflowExecutionEndQueue.emit(subflowExecutionEnd);
-                }
-
-                // purge SLA monitors
-                if (!ListUtils.isEmpty(executor.getFlow().getSla()) && executor.getFlow().getSla().stream().anyMatch(ExecutionMonitoringSLA.class::isInstance)) {
-                    slaMonitorStorage.purge(executor.getExecution().getId());
-                }
-
-                // check if there exist a queued execution and submit it to the execution queue
-                if (executor.getFlow().getConcurrency() != null && executor.getFlow().getConcurrency().getBehavior() == Concurrency.Behavior.QUEUE) {
-                    executionQueuedStorage.pop(executor.getFlow().getTenantId(),
-                        executor.getFlow().getNamespace(),
-                        executor.getFlow().getId(),
-                        throwConsumer(queued -> executionQueue.emit(queued.withState(State.Type.RUNNING)))
-                    );
-                }
-
-                // purge the trigger: reset scheduler trigger at end
-                if (execution.getTrigger() != null) {
-                    FlowWithSource flow = executor.getFlow();
-                    triggerRepository
-                        .findByExecution(execution)
-                        .ifPresent(trigger -> {
-                            this.triggerState.update(executionService.resetExecution(flow, execution, trigger));
-                        });
-                }
-
-                // Purge the workerTaskResultQueue and the workerJobQueue
-                // IMPORTANT: this is safe as only the executor is listening to WorkerTaskResult,
-                // and we are sure at this stage that all WorkerJob has been listened and processed by the Worker.
-                // If any of these assumptions changed, this code would not be safe anymore.
-                if (cleanWorkerJobQueue && !ListUtils.isEmpty(executor.getExecution().getTaskRunList())) {
-                    List<String> taskRunKeys = executor.getExecution().getTaskRunList().stream()
-                        .map(taskRun -> taskRun.getId())
-                        .toList();
-                    ((JdbcQueue<WorkerTaskResult>) workerTaskResultQueue).deleteByKeys(taskRunKeys);
-                    ((JdbcQueue<WorkerJob>) workerJobQueue).deleteByKeys(taskRunKeys);
-                }
+                executionStateChange.emit(new ExecutionStateChange(execution.getId(), executor.getOriginalState(), execution.getState().getCurrent()));
             }
         } catch (QueueException e) {
             if (!ignoreFailure) {
@@ -1194,6 +1146,83 @@ public class JdbcExecutor implements ExecutorInterface, Service {
                 this.toExecution(result);
             }
         });
+    }
+
+    private void executionStateChangeQueue(Either<ExecutionStateChange, DeserializationException> either) {
+        if (either.isRight()) {
+            log.error("Unable to deserialize an execution state change: {}", either.getRight().getMessage());
+            return;
+        }
+
+        final ExecutionStateChange executionStateChange = either.getLeft();
+
+        if (skipExecutionService.skipExecution(executionStateChange.getExecutionId())) {
+            log.warn("Skipping execution {}", executionStateChange.getExecutionId());
+            return;
+        }
+
+        try {
+            Execution execution = executionRepository.findById(null, executionStateChange.getExecutionId()).orElseThrow();
+            flowTriggerService.computeExecutionsFromFlowTriggers(execution, allFlows, Optional.of(multipleConditionStorage))
+                .forEach(throwConsumer(executionFromFlowTrigger -> this.executionQueue.emit(executionFromFlowTrigger)));
+
+            FlowWithSource flow = flowRepository.findByExecutionWithSource(execution);
+            boolean isTerminated = flow != null && executionService.isTerminated(flow, execution);
+
+
+            // handle actions on terminated state
+            if (isTerminated) {
+                // if there is a parent, we send a subflow execution result to it
+                if (ExecutableUtils.isSubflow(execution)) {
+                    // locate the parent execution to find the parent task run
+                    String parentExecutionId = (String) execution.getTrigger().getVariables().get("executionId");
+                    String taskRunId = (String) execution.getTrigger().getVariables().get("taskRunId");
+                    String taskId = (String) execution.getTrigger().getVariables().get("taskId");
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> outputs = (Map<String, Object>) execution.getTrigger().getVariables().get("taskRunOutputs");
+                    Variables variables = variablesService.of(StorageContext.forExecution(execution), outputs);
+                    SubflowExecutionEnd subflowExecutionEnd = new SubflowExecutionEnd(execution, parentExecutionId, taskRunId, taskId, execution.getState().getCurrent(), variables);
+                    this.subflowExecutionEndQueue.emit(subflowExecutionEnd);
+                }
+
+                // purge SLA monitors
+                if (!ListUtils.isEmpty(flow.getSla()) && flow.getSla().stream().anyMatch(ExecutionMonitoringSLA.class::isInstance)) {
+                    slaMonitorStorage.purge(execution.getId());
+                }
+
+                // check if there exist a queued execution and submit it to the execution queue
+                if (flow.getConcurrency() != null && flow.getConcurrency().getBehavior() == Concurrency.Behavior.QUEUE) {
+                    executionQueuedStorage.pop(flow.getTenantId(),
+                        flow.getNamespace(),
+                        flow.getId(),
+                        throwConsumer(queued -> executionQueue.emit(queued.withState(State.Type.RUNNING)))
+                    );
+                }
+
+                // purge the trigger: reset scheduler trigger at end
+                if (execution.getTrigger() != null) {
+                    triggerRepository
+                        .findByExecution(execution)
+                        .ifPresent(trigger -> {
+                            this.triggerState.update(executionService.resetExecution(flow, execution, trigger));
+                        });
+                }
+
+                // Purge the workerTaskResultQueue and the workerJobQueue
+                // IMPORTANT: this is safe as only the executor is listening to WorkerTaskResult,
+                // and we are sure at this stage that all WorkerJob has been listened and processed by the Worker.
+                // If any of these assumptions changed, this code would not be safe anymore.
+                if (cleanWorkerJobQueue && !ListUtils.isEmpty(execution.getTaskRunList())) {
+                    List<String> taskRunKeys = execution.getTaskRunList().stream()
+                        .map(taskRun -> taskRun.getId())
+                        .toList();
+                    ((JdbcQueue<WorkerTaskResult>) workerTaskResultQueue).deleteByKeys(taskRunKeys);
+                    ((JdbcQueue<WorkerJob>) workerJobQueue).deleteByKeys(taskRunKeys);
+                }
+            }
+        } catch (QueueException e) {
+            //FIXME
+        }
     }
 
     private boolean deduplicateNexts(Execution execution, ExecutorState executorState, List<TaskRun> taskRuns) {
