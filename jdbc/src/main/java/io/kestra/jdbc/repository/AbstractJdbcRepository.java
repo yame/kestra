@@ -335,8 +335,7 @@ public abstract class AbstractJdbcRepository {
             case EQUALS -> select = select.and(NAMESPACE_FIELD.eq((String) value));
             case NOT_EQUALS -> select = select.and(NAMESPACE_FIELD.ne((String) value));
             case CONTAINS -> select = select.and(NAMESPACE_FIELD.eq((String) value)
-                .or(NAMESPACE_FIELD.like( value + ".%"))
-                .or(NAMESPACE_FIELD.like("%." + value)))
+                    .or(NAMESPACE_FIELD.like( "%" + value + "%")))
             ;
             case STARTS_WITH -> select = select.and(NAMESPACE_FIELD.like(value + ".%")
                 .or(NAMESPACE_FIELD.eq((String) value)));
